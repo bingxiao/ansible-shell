@@ -33,11 +33,19 @@
 
 
 import cmd
-import ansible.runner
-from ansible.color import stringc, codeCodes
+#import ansible.runner
+from collections import namedtuple
+from ansible.parsing.dataloader import DataLoader
+from ansible.vars import VariableManager
+from ansible.inventory import Inventory
+from ansible.playbook.play import Play
+from ansible.executor.task_queue_manager import TaskQueueManager
+
+#from ansible.color import stringc, codeCodes
+from ansible.utils.color import stringc, codeCodes
 import ansible.constants as C
 from ansible import utils
-from ansible import callbacks
+#from ansible import callbacks
 from ansible.inventory import Inventory, Host
 import ansible.utils.module_docs as module_docs
 import getpass
@@ -48,6 +56,17 @@ import readline
 import rlcompleter
 import atexit
 
+import ConfigParser
+from ansible import cli
+from ansible.cli import CLI
+
+import ansible
+
+from ansible.plugins import module_loader
+
+from pprint import pprint
+import pdb
+debug = False
 
 class colorizer(object):
     def __init__(self, color):
@@ -62,22 +81,44 @@ class colorizer(object):
         sys.stdout.write("\033[0m")
 
 
-class AnsibleShell(cmd.Cmd):
+class AnsibleShell(CLI, cmd.Cmd):
 
     modules = []
 
     def __init__(self, options, args):
         self.options = options
         self.options.cwd = '*'
-        self.ssh_password, self.become_password, self.vault_password = self.load_passwords()
-        self.ansible = ansible.runner.Runner(
-            inventory=Inventory(self.options.inventory,
-                                vault_password=self.vault_password),
-            vault_pass=self.vault_password,
-        )
-        self.groups = self.ansible.inventory.groups_list().keys()
-        self.hosts = self.ansible.inventory.groups_list()['all']
-        self.callbacks = callbacks.CliRunnerCallbacks()
+
+        sshpass    = None
+        becomepass    = None
+        vault_pass = None
+        passwords = {}
+
+        if False:
+            ## Password part see: ./lib/ansible/cli/playbook.py
+            #self.ssh_password, self.become_password, self.vault_password = self.load_passwords()
+            #(self.ssh_password, self.become_password) = self.load_passwords()
+            self.ssh_password = sshpass
+            self.become_password = becomepass
+            self.vault_password = vault_pass
+        #self.ansible = ansible.runner.Runner(
+        #    inventory=Inventory(self.options.inventory,
+        #                        vault_password=self.vault_password),
+        #    vault_pass=self.vault_password,
+        #)
+        #self.groups = self.ansible.inventory.groups_list().keys()
+        #self.hosts = self.ansible.inventory.groups_list()['all']
+        variable_manager = VariableManager()
+        loader = DataLoader()
+        #self.inventory = Inventory(loader=loader, variable_manager=variable_manager, host_list=self.options.cwd)
+        self.inventory = Inventory(loader=loader, variable_manager=variable_manager, host_list='/etc/defaults/hosts') # this OK.
+
+        #self.groups = self.inventory.groups_list().keys()
+        #self.hosts = self.inventory.groups_list()['all']
+        self.groups = self.inventory.get_groups().keys()
+        self.hosts = self.inventory.get_groups()['all']
+
+        #self.callbacks = callbacks.CliRunnerCallbacks()
         self.read_config_file()
         self.intro = 'Welcome to the ansible-shell.\nType help or ? to list commands.\n'
         self.set_prompt()
@@ -88,37 +129,45 @@ class AnsibleShell(cmd.Cmd):
             setattr(self, 'help_' + module, lambda module=module: self.helpdefault(module))
         cmd.Cmd.__init__(self)
 
+
     def load_passwords(self):
-        return utils.ask_passwords(
+        #return utils.ask_passwords(
+        #return cli.CLI.ask_passwords(CLI())
+        return self.ask_passwords(
                 self.options.ask_pass,
-                self.options.become_ask_pass,
-                self.options.ask_vault_pass
+                #self.options.become_ask_pass,
+                #self.options.ask_vault_pass
                 )
 
     def read_config_file(self):
+        # hwc works.
         allowed_items = {
             # name: type
             'cwd': 'str',
             'forks': 'int',
         }
-        config = C.load_config_file()
+        config, CONFIG_FILE = C.load_config_file()
         if config is not None and config.has_section('ansible-shell'):
             for item in config.items('ansible-shell'):
                 if item[0] in allowed_items.keys():
                     value = vars(__builtins__)[allowed_items[item[0]]](item[1])
                     setattr(self.options, item[0], value)
+        #self.options.cwd = "*"
+        self.options.forks = 5
+
 
     @staticmethod
     def parse_opts():
-        parser = utils.base_parser(
-            constants=C,
+        #parser = utils.base_parser(
+        parser = CLI.base_parser(
+        #    constants=C,
             runas_opts=True,
             subset_opts=True,
             async_opts=True,
-            output_opts=True,
+            #output_opts=True,   # FIXME: optparse.OptionConflictError: option -t/--tree: conflicting option string(s): -t
             connect_opts=True,
             check_opts=True,
-            diff_opts=False,
+            #diff_opts=False,    # FIXME: depricated?
             usage='%prog <host-pattern> [options]'
         )
 
@@ -134,16 +183,20 @@ class AnsibleShell(cmd.Cmd):
     def cmdloop(self):
         try:
             cmd.Cmd.cmdloop(self)
+            if debug:
+                print "cmdloop looping"
         except KeyboardInterrupt:
+            if debug:
+                print "KeyboardInterrupt", found
             self.do_exit(self)
 
     def set_prompt(self):
-        self.selected = self.ansible.inventory.list_hosts(self.options.cwd)
+        self.selected = self.inventory.list_hosts(self.options.cwd)
         self.prompt = "%s@%s (%d)[f:%s]$ " % (self.options.remote_user, self.options.cwd, len(self.selected), self.options.forks)
 
     def list_modules(self):
         modules = set()
-        module_paths = ansible.utils.plugins.module_finder._get_paths()
+        module_paths = module_loader._get_paths()
         for path in module_paths:
             if path is not None:
                 modules.update(self._find_modules_in_path(path))
@@ -158,7 +211,7 @@ class AnsibleShell(cmd.Cmd):
                 ext = basename.split('.')[-1] if '.' in basename else None
                 if not module_name.startswith('_') and \
                    ext in ('py', 'ps1', None) and \
-                   module_name in utils.plugins.module_finder:
+                   module_name in module_loader:
                     yield module_name
 
     def confirm(self, module, module_args):
@@ -166,12 +219,15 @@ class AnsibleShell(cmd.Cmd):
             return True
 
         # print hosts
-        callbacks.display("HOSTS:","bright blue")
+        #callbacks.display("HOSTS:","bright blue")
+        print "HOSTS:"
         for host in self.selected:
             hostname = host.name if isinstance(host, Host) else host
-            callbacks.display("\t%s" % hostname,"green")
+            #callbacks.display("\t%s" % hostname,"green")
+            print "\t%s" % hostname
 
-        callbacks.display("\nSUMMARY: host_num[%d] module[%s] module_args[%s] options[%s]\n" % (len(self.selected), module, module_args, self.options),"bright blue")
+        #callbacks.display("\nSUMMARY: host_num[%d] module[%s] module_args[%s] options[%s]\n" % (len(self.selected), module, module_args, self.options),"bright blue")
+        print "\nSUMMARY: host_num[%d] module[%s] module_args[%s] options[%s]\n" % (len(self.selected), module, module_args, self.options)
 
         answer=False
         try:
@@ -203,39 +259,116 @@ class AnsibleShell(cmd.Cmd):
             module_args = arg
 
         if not self.confirm(module, module_args):
-            callbacks.display("Command canceled by user")
+            #callbacks.display("Command canceled by user")
+            print "Command canceled by user"
             return
 
         self.options.module_name = module
-        self.callbacks.options = self.options
+        #self.callbacks.options = self.options
 
+        ## try:
+        ##     results = ansible.runner.Runner(
+        ##         pattern=self.options.cwd,
+        ##         module_name=module,
+        ##         module_args=module_args,
+        ##         remote_user=self.options.remote_user,
+        ##         timeout=self.options.timeout,
+        ##         private_key_file=self.options.private_key_file,
+        ##         forks=self.options.forks,
+        ##         become=self.options.become,
+        ##         become_user=self.options.become_user,
+        ##         become_pass=self.become_password,
+        ##         become_method=self.options.become_method,
+        ##         transport=self.options.connection,
+        ##         subset=self.options.subset,
+        ##         check=self.options.check,
+        ##         diff=self.options.check,
+        ##         callbacks=self.callbacks,
+        ##         inventory=self.ansible.inventory,
+        ##         vault_pass=self.vault_password,
+        ##     ).run()
+        ##     if results is None:
+        ##         print "No hosts found"
+        ##         return False
+        ## except Exception as e:
+        ##     print unicode(e)
+        ##     return False
+
+        Options = namedtuple('Options', ['connection','module_path', 'forks', 'remote_user', 'private_key_file', 'ssh_common_args', 'ssh_extra_args', 'sftp_extra_args', 'scp_extra_args', 'become', 'become_method', 'become_user', 'verbosity', 'check'])
+        # initialize needed objects
+        variable_manager = VariableManager()
+        loader = DataLoader()
+        module_path = module_loader.find_plugin(self.options.module_name)
+        if debug: 
+            print module_path
+            print self.options
+        #module_path = None   # test if can be unset  ## FIXME
+        options = Options(
+                #connection = 'local', 
+                connection = self.options.connection,
+                module_path = module_path,
+                forks = self.options.forks,
+                remote_user = self.options.remote_user,
+                private_key_file = self.options.private_key_file,
+                ssh_common_args = None,
+                ssh_extra_args = None,
+                sftp_extra_args = None,
+                scp_extra_args = None,
+                become = self.options.become,
+                become_method = self.options.become_method,
+                become_user = self.options.become_user,
+                verbosity = None,
+                check = self.options.check)
+        passwords = dict(vault_pass='secret')
+
+
+        ## create inventory and pass to var manager
+        inventory = Inventory(loader=loader, variable_manager=variable_manager, host_list='/etc/defaults/hosts')
+        if debug:
+            print "Hosts read:"
+            print inventory.get_hosts()
+        variable_manager.set_inventory(inventory)
+
+        ## create play with tasks
+        play_source =  dict(
+                name = "playing like shell",
+                hosts = self.options.cwd,
+                gather_facts = 'no',
+                #tasks = [ dict(action=dict(module='debug', args=dict(msg='Hello Galaxy!'))) ]
+                #tasks = [ dict(action=dict(module=module, args=module_args)) ]   # OK
+                tasks = [ 
+                    dict(action=dict(module=module, args=module_args), async=30, poll=5, register="return"), 
+                    dict(action="debug var=return.stdout_lines")
+                    ]  
+                )
+        if debug:
+            pprint( play_source )
+        play = Play().load(play_source, variable_manager=variable_manager, loader=loader)
+        tqm = None
         try:
-            results = ansible.runner.Runner(
-                pattern=self.options.cwd,
-                module_name=module,
-                module_args=module_args,
-                remote_user=self.options.remote_user,
-                timeout=self.options.timeout,
-                private_key_file=self.options.private_key_file,
-                forks=self.options.forks,
-                become=self.options.become,
-                become_user=self.options.become_user,
-                become_pass=self.become_password,
-                become_method=self.options.become_method,
-                transport=self.options.connection,
-                subset=self.options.subset,
-                check=self.options.check,
-                diff=self.options.check,
-                callbacks=self.callbacks,
-                inventory=self.ansible.inventory,
-                vault_pass=self.vault_password,
-            ).run()
-            if results is None:
-                print "No hosts found"
-                return False
+            tqm = TaskQueueManager(
+                    inventory=inventory,
+                    variable_manager=variable_manager,
+                    loader=loader,
+                    options=options,
+                    passwords=passwords,
+                    stdout_callback='default',
+                     )
+            result = tqm.run(play)
+            print "EXIT CODE:", result
         except Exception as e:
             print unicode(e)
             return False
+        finally:
+            pass
+            #if tqm is not None:
+            #    tqm.cleanup()
+
+        if debug: 
+            print "========="
+        return True
+
+
 
     def emptyline(self):
         return
@@ -277,12 +410,12 @@ class AnsibleShell(cmd.Cmd):
             self.options.cwd = '*'
         elif arg == '..':
             try:
-                self.options.cwd = self.ansible.inventory.groups_for_host(self.options.cwd)[1].name
+                self.options.cwd = self.inventory.groups_for_host(self.options.cwd)[1].name
             except Exception:
                 self.options.cwd = ''
         elif arg == '/':
             self.options.cwd = 'all'
-        elif self.ansible.inventory.get_hosts(arg):
+        elif self.inventory.get_hosts(arg):
             self.options.cwd = arg
         else:
             print "no host matched"
@@ -292,7 +425,7 @@ class AnsibleShell(cmd.Cmd):
     def do_list(self, arg):
         """List the hosts in the current group"""
         if arg == 'groups':
-            items = self.ansible.inventory.list_groups()
+            items = self.inventory.list_groups()
         else:
             items = self.selected
         for item in items:
@@ -328,7 +461,7 @@ class AnsibleShell(cmd.Cmd):
 
     def helpdefault(self, module_name):
         if module_name in self.modules:
-            in_path = utils.plugins.module_finder.find_plugin(module_name)
+            in_path = module_loader.find_plugin(module_name)
             oc, a, _ = ansible.utils.module_docs.get_docstring(in_path)
             print stringc(oc['short_description'], 'bright gray')
             print 'Parameters:'
@@ -342,7 +475,7 @@ class AnsibleShell(cmd.Cmd):
         if self.options.cwd == '*':
             completions = self.hosts + self.groups
         else:
-            completions = self.ansible.inventory.list_hosts(self.options.cwd)
+            completions = self.inventory.list_hosts(self.options.cwd)
 
         return [s[offs:] for s in completions if s.startswith(mline)]
 
@@ -355,7 +488,7 @@ class AnsibleShell(cmd.Cmd):
             return [s[offs:] + '=' for s in completions if s.startswith(mline)]
 
     def module_args(self, module_name):
-        in_path = utils.plugins.module_finder.find_plugin(module_name)
+        in_path = module_loader.find_plugin(module_name)
         oc, a, _ = ansible.utils.module_docs.get_docstring(in_path)
         return oc['options'].keys()
 
